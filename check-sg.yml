@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Check AWS Security Group change and remediate it if not compliant"
+
+Parameters:
+  Contact:
+    Type: "String"
+    Default: "cannereau"
+    Description: "Creator's username"
+  Application:
+    Type: "String"
+    Default: "Security"
+    Description: "Application's name"
+  Flow:
+    Type: "String"
+    Default: "I"
+    Description: "Flow way : [I]ngress, [E]gress or [A]ll"
+  IPv4:
+    Type: "String"
+    Default: "0.0.0.0/0"
+    Description: "Comma separated IPv4 CIDR masks"
+  IPv6:
+    Type: "String"
+    Default: "::/0"
+    Description: "Comma separated IPv6 CIDR masks"
+  Ports:
+    Type: "String"
+    Description: "Comma separated protocol ports"
+
+Resources:
+
+  SecurityGroupChangeRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "check-sg-change"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Action: "sts:AssumeRole"
+          Principal:
+            Service: "lambda.amazonaws.com"
+      Policies:
+        - PolicyName: "lambda-default"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: "Allow"
+              Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+              Resource:
+              - "arn:aws:logs:*:*:log-group:/aws/lambda/*"
+              - "arn:aws:logs:*:*:log-group:/aws/lambda/*:*"
+        - PolicyName: "revoke-sg-rule"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: "Allow"
+              Action:
+              - "ec2:RevokeSecurityGroupIngress"
+              - "ec2:RevokeSecurityGroupEgress"
+              Resource: "*"
+
+  SecurityGroupChangeFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "check-sg-change"
+      Description: "Check Security Group change and remediate it if not compliant"
+      Handler: "index.handler"
+      Runtime: "python3.7"
+      MemorySize: 128
+      Timeout: 3
+      Role: !GetAtt SecurityGroupChangeRole.Arn
+      Environment:
+        Variables:
+          rule_way: !Ref Flow
+          rule_ip4: !Ref IPv4
+          rule_ip6: !Ref IPv6
+          rule_ports: !Ref Ports
+      Tags:
+      -
+        Key: "Contact"
+        Value: !Ref Contact
+      -
+        Key: "Application"
+        Value: !Ref Application
+      Code:
+        ZipFile: |
+          import os, json, boto3, logging
+
+          # cold start
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          logger.info('#000 - loading function...')
+          logger.info('#001 - rule way : {}'.format(os.environ['rule_way']))
+          logger.info('#002 - rule IPv4 : {}'.format(os.environ['rule_ip4']))
+          logger.info('#003 - rule IPv6 : {}'.format(os.environ['rule_ip6']))
+          logger.info('#004 - rule ports : {}'.format(os.environ['rule_ports']))
+          rule_way = os.environ['rule_way']
+          rule_ip4 = os.environ['rule_ip4'].split(',')
+          rule_ip6 = os.environ['rule_ip6'].split(',')
+          rule_ports = os.environ['rule_ports'].split(',')
+
+          def handler(event, context):
+
+            # starting handler
+            logger.info('#010 - received event : {}'.format(event))
+
+            # get event detail
+            try:
+              event_detail = event['detail']
+              event_name = event_detail['eventName']
+              logger.info('#011 - event name : {}'.format(event_name))
+            except Exception as e:
+              logger.error('#901 : lambda not triggered by an event')
+              return
+
+            # check event type
+            if ((event_name == 'AuthorizeSecurityGroupIngress' and
+                (rule_way == 'I' or rule_way == 'A')) or
+                (event_name == 'AuthorizeSecurityGroupEgress' and
+                (rule_way == 'E' or rule_way == 'A'))):
+
+              # get event parameters
+              params = event_detail['requestParameters']
+              logger.info('#012 - security group : {}'.format(params['groupId']))
+
+              # build rules to revoke
+              rules2revoke = []
+              for rule in params['ipPermissions']['items']:
+                rule2revoke = {
+                  'IpProtocol': rule['ipProtocol'],
+                  'FromPort': rule['fromPort'],
+                  'ToPort': rule['toPort']
+                }
+
+                # IPv6 compliancy
+                if 'ipv6Ranges' in rule and rule['ipv6Ranges']:
+                    masks2revoke = []
+                    for mask in rule['ipv6Ranges']['items']:
+                        if ((mask['cidrIpv6'] in rule_ip6) or
+                            (str(rule['fromPort']) in rule_ports)):
+                          logger.info('#020 - non compliant cidr [port] : {} [{}]'.format(
+                            mask['cidrIpv6'], rule['fromPort']
+                          ))
+                          masks2revoke.append({'CidrIpv6': mask['cidrIpv6']})
+                    if masks2revoke:
+                        rule2revoke['Ipv6Ranges'] = masks2revoke
+                        rules2revoke.append(rule2revoke)
+          
+                # IPv4 compliancy
+                if 'ipRanges' in rule and rule['ipRanges']:
+                    masks2revoke = []
+                    for mask in rule['ipRanges']['items']:
+                        if ((mask['cidrIp'] in rule_ip4) or
+                            (str(rule['fromPort']) in rule_ports)):
+                          logger.info('#020 - non compliant cidr [port] : {} [{}]'.format(
+                            mask['cidrIp'], rule['fromPort']
+                          ))
+                          masks2revoke.append({'CidrIp': mask['cidrIp']})
+                    if masks2revoke:
+                        rule2revoke['IpRanges'] = masks2revoke
+                        rules2revoke.append(rule2revoke)
+
+              # revoke rules
+              if rules2revoke:
+                if event_name == 'AuthorizeSecurityGroupIngress':
+                  boto3.client('ec2').revoke_security_group_ingress(
+                    GroupId = params['groupId'],
+                    IpPermissions = rules2revoke
+                  )
+                else:
+                  boto3.client('ec2').revoke_security_group_ingress(
+                    GroupId = params['groupId'],
+                    IpPermissions = rules2revoke
+                  )
+
+  SecurityGroupChangePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      FunctionName: !Ref SecurityGroupChangeFunction
+
+  SecurityGroupChangeEvent:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: "sg-change"
+      Description: "Intercept security group change"
+      State: "ENABLED"
+      EventPattern:
+        detail:
+          eventSource:
+          - "ec2.amazonaws.com"
+          eventName:
+          - "AuthorizeSecurityGroupIngress"
+          - "AuthorizeSecurityGroupEgress"
+      Targets:
+        -
+          Arn: !GetAtt SecurityGroupChangeFunction.Arn
+          Id: "invoke-check-sg-change"
